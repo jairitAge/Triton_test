@@ -1,9 +1,15 @@
 """
-Triton Conv3d — Implicit GEMM approach.
+Triton Conv3d — Implicit GEMM approach (optimized).
 
-Layout: NDHWC (channels-last) internally for coalesced memory access.
-The public API accepts standard PyTorch NCDHW tensors and converts
-automatically.
+Optimizations over baseline:
+- NDHWC (channels-last) layout for coalesced memory access
+- Weight reordered to (C_out, kD, kH, kW, C_in/g) for K-dimension alignment
+- make_block_ptr + advance for structured weight loads
+- Restructured K-loop: outer tl.static_range spatial + inner tl.range channel
+  (eliminates all integer division/modulo in the hot loop)
+- tl.range(num_stages=3) software pipelining
+
+The public API accepts standard PyTorch NCDHW tensors and converts automatically.
 
 Algorithm
 ---------
@@ -13,7 +19,7 @@ Conv3d is reformulated as GEMM:
 
 where
     M     = batch * D_out * H_out * W_out   (output spatial positions)
-    K     = (C_in / groups) * kD * kH * kW  (filter volume)
+    K     = kD * kH * kW * (C_in / groups)  (filter volume, spatial-outer/channel-inner)
     N_out = C_out_per_group                 (output channels per group)
 
 InputCol is never materialised; indices are computed on-the-fly inside the
@@ -33,16 +39,13 @@ import triton.language as tl
 # ---------------------------------------------------------------------------
 
 _AUTOTUNE_CONFIGS = [
-    # Small tiles for small problems / low channel counts
-    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 32,  "BLOCK_K": 32}, num_warps=4, num_stages=4),
-    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 32,  "BLOCK_K": 32}, num_warps=4, num_stages=4),
-    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 64,  "BLOCK_K": 32}, num_warps=4, num_stages=4),
-    # Medium tiles
+    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 32,  "BLOCK_K": 32}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 32,  "BLOCK_K": 32}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 64,  "BLOCK_K": 32}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 32}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 32}, num_warps=8, num_stages=3),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 32}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=4, num_stages=3),
-    # Large tiles for high channel counts
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=3),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 64}, num_warps=8, num_stages=2),
@@ -53,7 +56,7 @@ _AUTOTUNE_CONFIGS = [
 
 
 # ---------------------------------------------------------------------------
-# Forward kernel  (Implicit GEMM)
+# Forward kernel  (Implicit GEMM — optimized)
 # ---------------------------------------------------------------------------
 
 @triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["M", "N_out", "K"])
@@ -75,7 +78,7 @@ def _conv3d_fwd_kernel(
     N_out,
     K,
     stride_in_n, stride_in_d, stride_in_h, stride_in_w, stride_in_c,
-    stride_wt_o, stride_wt_i,
+    stride_wt_n, stride_wt_k,
     stride_out_n, stride_out_d, stride_out_h, stride_out_w, stride_out_c,
     HAS_BIAS: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
@@ -86,6 +89,7 @@ def _conv3d_fwd_kernel(
     pid = tl.program_id(0)
     group_id = tl.program_id(1)
 
+    # --- Tile scheduling with grouped ordering for L2 locality ---
     num_M_tiles = tl.cdiv(M, BLOCK_M)
     num_N_tiles = tl.cdiv(N_out, BLOCK_N)
 
@@ -101,6 +105,7 @@ def _conv3d_fwd_kernel(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+    # --- Decode M → (n, d_out, h_out, w_out) ---
     HW_out = H_out * W_out
     DHW_out = D_out * HW_out
 
@@ -111,67 +116,74 @@ def _conv3d_fwd_kernel(
     h_out_idx = rem2 // W_out
     w_out_idx = rem2 % W_out
 
-    HW_k = kH * kW
-    DHW_k = kD * HW_k
-
-    c_out_idx = rn + group_id * C_out_per_group
-
-    # base addresses for input (per output position, no K component yet)
-    base_in_addr = (
-        n_idx * stride_in_n
-        + group_id * C_in_per_group * stride_in_c
-    )
     valid_m = rm < M
 
-    for k_start in range(0, K, BLOCK_K):
-        rk = k_start + tl.arange(0, BLOCK_K)
+    # --- Weight block pointer (Phase A) ---
+    # Weight is (C_out, K_vol) with K laid out as [kd, kh, kw, c_in] (Phase C).
+    # Viewed as (K_vol, C_out_per_group), strides (1, K_vol).
+    B_block_ptr = tl.make_block_ptr(
+        base=weight_ptr + group_id * C_out_per_group * stride_wt_n,
+        shape=(K, N_out),
+        strides=(stride_wt_k, stride_wt_n),
+        offsets=(0, pid_n * BLOCK_N),
+        block_shape=(BLOCK_K, BLOCK_N),
+        order=(0, 1),
+    )
 
-        c_in_idx = rk // DHW_k
-        k_rem = rk % DHW_k
-        kd_idx = k_rem // HW_k
-        k_rem2 = k_rem % HW_k
-        kh_idx = k_rem2 // kW
-        kw_idx = k_rem2 % kW
+    # Input base per output position: batch offset + group channel offset
+    inp_n_base = n_idx * stride_in_n + group_id * C_in_per_group * stride_in_c
 
-        d_in = d_out_idx[:, None] * stride_d - pad_d + kd_idx[None, :] * dil_d
-        h_in = h_out_idx[:, None] * stride_h - pad_h + kh_idx[None, :] * dil_h
-        w_in = w_out_idx[:, None] * stride_w - pad_w + kw_idx[None, :] * dil_w
+    # --- Spatial outer loops + channel inner loop (pipelined) ---
+    for kd in tl.range(kD):
+        d_in = d_out_idx * stride_d - pad_d + kd * dil_d
+        d_valid = (d_in >= 0) & (d_in < D_in)
 
-        mask_a = (
-            (d_in >= 0) & (d_in < D_in)
-            & (h_in >= 0) & (h_in < H_in)
-            & (w_in >= 0) & (w_in < W_in)
-            & (rk[None, :] < K)
-            & valid_m[:, None]
-        )
+        for kh in tl.range(kH):
+            h_in = h_out_idx * stride_h - pad_h + kh * dil_h
+            dh_valid = d_valid & (h_in >= 0) & (h_in < H_in)
 
-        addr_a = (
-            base_in_addr[:, None]
-            + d_in * stride_in_d
-            + h_in * stride_in_h
-            + w_in * stride_in_w
-            + c_in_idx[None, :] * stride_in_c
-        )
-        a = tl.load(input_ptr + addr_a, mask=mask_a, other=0.0)
+            for kw in tl.range(kW):
+                w_in = w_out_idx * stride_w - pad_w + kw * dil_w
+                spatial_valid = dh_valid & (w_in >= 0) & (w_in < W_in) & valid_m
 
-        # Weight is contiguous (C_out, K_vol) — simple 2D indexing
-        mask_b = (rk[:, None] < K) & (rn[None, :] < N_out)
-        addr_b = c_out_idx[None, :] * stride_wt_o + rk[:, None] * stride_wt_i
-        b = tl.load(weight_ptr + addr_b, mask=mask_b, other=0.0)
-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+                inp_spatial = (
+                    inp_n_base
+                    + d_in * stride_in_d
+                    + h_in * stride_in_h
+                    + w_in * stride_in_w
+                )
 
+                for c_start in tl.range(0, C_in_per_group, BLOCK_K, num_stages=3):
+                    rc = c_start + tl.arange(0, BLOCK_K)
+
+                    mask_a = spatial_valid[:, None] & (rc[None, :] < C_in_per_group)
+                    addr_a = inp_spatial[:, None] + rc[None, :] * stride_in_c
+                    a = tl.load(input_ptr + addr_a, mask=mask_a, other=0.0)
+
+                    b = tl.load(B_block_ptr, boundary_check=(0, 1))
+
+                    acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+                    B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))
+
+                # Correct block-ptr overshoot when C_in_per_group % BLOCK_K != 0
+                num_c_iters = tl.cdiv(C_in_per_group, BLOCK_K)
+                overshoot = num_c_iters * BLOCK_K - C_in_per_group
+                B_block_ptr = tl.advance(B_block_ptr, (-overshoot, 0))
+
+    # --- Bias ---
     if HAS_BIAS:
-        bias_idx = rn + group_id * C_out_per_group
-        bias_vals = tl.load(bias_ptr + bias_idx, mask=rn < N_out, other=0.0)
+        bias_offs = rn + group_id * C_out_per_group
+        bias_vals = tl.load(bias_ptr + bias_offs, mask=rn < N_out, other=0.0)
         acc += bias_vals[None, :]
 
-    c_out_store = rn + group_id * C_out_per_group
+    # --- Store output ---
+    out_c_idx = rn + group_id * C_out_per_group
     out_addr = (
         n_idx[:, None] * stride_out_n
         + d_out_idx[:, None] * stride_out_d
         + h_out_idx[:, None] * stride_out_h
         + w_out_idx[:, None] * stride_out_w
-        + c_out_store[None, :] * stride_out_c
+        + out_c_idx[None, :] * stride_out_c
     )
     mask_out = valid_m[:, None] & (rn[None, :] < N_out)
     tl.store(output_ptr + out_addr, acc.to(output_ptr.dtype.element_ty), mask=mask_out)
@@ -186,13 +198,15 @@ def _compute_output_size(in_size, kernel, stride, pad, dilation):
 
 
 def _weight_to_gemm(w: torch.Tensor) -> torch.Tensor:
-    """(C_out, C_in/g, kD, kH, kW) → (C_out, K_vol) as a view (already contiguous)."""
-    C_out = w.shape[0]
-    return w.reshape(C_out, -1)
+    """Reorder and reshape weight for spatial-outer / channel-inner K layout.
+
+    (C_out, C_in/g, kD, kH, kW) → (C_out, kD, kH, kW, C_in/g) → (C_out, K_vol)
+    """
+    return w.permute(0, 2, 3, 4, 1).contiguous().reshape(w.shape[0], -1)
 
 
 def triton_conv3d_forward(
-    input: torch.Tensor,      # NCDHW (contiguous)
+    input: torch.Tensor,      # NCDHW
     weight: torch.Tensor,     # (C_out, C_in/g, kD, kH, kW)
     bias: torch.Tensor | None,
     stride: tuple[int, int, int],
@@ -214,13 +228,15 @@ def triton_conv3d_forward(
     H_out = _compute_output_size(H_in, kH, stride_h, pad_h, dil_h)
     W_out = _compute_output_size(W_in, kW, stride_w, pad_w, dil_w)
 
-    inp = input.contiguous()
+    # Phase B: convert to channels-last (NDHWC) for coalesced channel access
+    inp = input.contiguous(memory_format=torch.channels_last_3d)
+    # Phase C: reorder weight K-dimension to [kd, kh, kw, c_in]
     w_2d = _weight_to_gemm(weight)
 
-    # Allocate output directly in NCDHW
     output = torch.empty(
         (batch, C_out, D_out, H_out, W_out),
         device=input.device, dtype=input.dtype,
+        memory_format=torch.channels_last_3d,
     )
 
     C_out_per_group = C_out // groups
@@ -228,9 +244,6 @@ def triton_conv3d_forward(
     K = C_in_per_group * kD * kH * kW
     N_out = C_out_per_group
 
-    # Pass raw strides — kernel uses them for scatter/gather addressing
-    # Input is NCDHW contiguous: strides are (C_in*D*H*W, D*H*W, H*W, W, 1)
-    # but we pass as (n, c, d, h, w) order matching kernel param names
     si_n = inp.stride(0)
     si_c = inp.stride(1)
     si_d = inp.stride(2)
@@ -288,7 +301,6 @@ class _TritonConv3dFunction(torch.autograd.Function):
         input, weight, bias = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
 
-        # Fallback to PyTorch for backward (Phase 5 will replace with Triton kernels)
         if ctx.needs_input_grad[0]:
             grad_input = torch.nn.grad.conv3d_input(
                 input.shape, weight, grad_output,
